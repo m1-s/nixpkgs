@@ -201,15 +201,11 @@ let
 
     passthru = let
       this = self.callPackage generic args;
-      jitToggle = this.override {
-        jitSupport = !jitSupport;
-      };
     in
     {
       psqlSchema = lib.versions.major version;
 
-      withJIT = if jitSupport then this else jitToggle;
-      withoutJIT = if jitSupport then jitToggle else this;
+      withJIT = this.override { jitSupport = true; };
 
       dlSuffix = if olderThan "16" then ".so" else stdenv.hostPlatform.extensions.sharedLibrary;
 
@@ -296,8 +292,13 @@ let
       wrapProgram $out/bin/postgres --set NIX_PGLIBDIR $out/lib
     '';
 
-    passthru.version = postgresql.version;
-    passthru.psqlSchema = postgresql.psqlSchema;
+    passthru = {
+      inherit (postgresql) version psqlSchema;
+      withJIT = postgresqlWithPackages {
+        inherit buildEnv;
+        postgresql = postgresql.withJIT;
+      } f;
+    };
   };
 
 in
