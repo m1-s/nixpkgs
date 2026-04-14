@@ -150,6 +150,8 @@ let
       # Uring
       uringSupport ? lib.versionAtLeast version "18" && lib.meta.availableOn stdenv.hostPlatform liburing,
       liburing,
+
+      extensions ? _: [],
     }@args:
     let
       atLeast = lib.versionAtLeast version;
@@ -170,7 +172,8 @@ let
         else
           stdenv;
     in
-    stdenv'.mkDerivation (finalAttrs: {
+    let
+      base = stdenv'.mkDerivation (finalAttrs: {
       inherit version;
       pname = "postgresql";
 
@@ -560,7 +563,9 @@ let
 
           psqlSchema = lib.versions.major version;
 
-          withJIT = if jitSupport then this.withPackages (_: [ this.jit ]) else null;
+          withJIT = if jitSupport then this.override {
+            extensions = ps: extensions ps ++ [ this.jit ];
+          } else null;
           withoutJIT = this;
 
           pkgs =
@@ -573,21 +578,22 @@ let
                   tclSupport
                   ;
                 inherit (llvmPackages) llvm;
-                postgresql = this;
+                # Use finalPackage (the mkDerivation) not this (which may be a buildEnv)
+                # to avoid infinite recursion when building extensions
+                postgresql = finalAttrs.finalPackage;
                 stdenv = stdenv';
                 postgresqlTestExtension = newSuper.callPackage ./postgresqlTestExtension.nix { };
                 postgresqlBuildExtension = newSuper.callPackage ./postgresqlBuildExtension.nix { };
               };
               newSelf = self // scope;
               newSuper = {
-                callPackage = newScope (scope // this.pkgs);
+                callPackage = newScope (scope // finalAttrs.finalPackage.pkgs);
               };
             in
             import ./ext.nix newSelf newSuper;
 
-          withPackages = postgresqlWithPackages {
-            inherit buildEnv lib makeBinaryWrapper;
-            postgresql = this;
+          withPackages = f: this.override {
+            extensions = ps: extensions ps ++ f ps;
           };
 
           pg_config = buildPackages.callPackage ./pg_config.nix {
@@ -641,73 +647,63 @@ let
       };
     });
 
-  postgresqlWithPackages =
-    {
-      postgresql,
-      buildEnv,
-      lib,
-      makeBinaryWrapper,
-    }:
-    f:
-    let
-      installedExtensions = f postgresql.pkgs;
-      recurse = postgresqlWithPackages {
-        inherit
-          buildEnv
-          lib
-          makeBinaryWrapper
-          postgresql
-          ;
-      };
-      finalPackage = buildEnv {
-        pname = "${postgresql.pname}-and-plugins";
-        inherit (postgresql) version;
-        paths = installedExtensions ++ [
-          # consider keeping in-sync with `postBuild` below
-          postgresql
-          postgresql.man # in case user installs this into environment
-        ];
+      installedExtensions = extensions base.pkgs;
+    in
+    if installedExtensions == [] then
+      base
+    else
+      let
+        finalPackage = buildEnv {
+          pname = "${base.pname}-and-plugins";
+          inherit (base) version;
+          paths = installedExtensions ++ [
+            base
+            base.man
+          ];
 
-        pathsToLink = [
-          "/"
-          "/bin"
-          "/share/postgresql/extension"
-          # Unbreaks Omnigres' build system
-          "/share/postgresql/timezonesets"
-          "/share/postgresql/tsearch_data"
-        ];
+          pathsToLink = [
+            "/"
+            "/bin"
+            "/share/postgresql/extension"
+            # Unbreaks Omnigres' build system
+            "/share/postgresql/timezonesets"
+            "/share/postgresql/tsearch_data"
+          ];
 
-        nativeBuildInputs = [ makeBinaryWrapper ];
-        postBuild =
-          let
-            args = lib.concatMap (ext: ext.wrapperArgs or [ ]) installedExtensions;
-          in
-          ''
-            wrapProgram "$out/bin/postgres" ${lib.concatStringsSep " " args}
-          '';
+          nativeBuildInputs = [ makeBinaryWrapper ];
+          postBuild =
+            let
+              wrapperArgs = lib.concatMap (ext: ext.wrapperArgs or [ ]) installedExtensions;
+            in
+            ''
+              wrapProgram "$out/bin/postgres" ${lib.concatStringsSep " " wrapperArgs}
+            '';
 
-        passthru = {
-          inherit installedExtensions;
-          inherit (postgresql)
-            pkgs
-            psqlSchema
-            ;
-
-          pg_config = postgresql.pg_config.override {
-            outputs = {
-              out = finalPackage;
-              man = finalPackage;
-            };
+          meta = base.meta // {
+            outputsToInstall = [ "out" ];
           };
 
-          withJIT = recurse (_: installedExtensions ++ [ postgresql.jit ]);
-          withoutJIT = recurse (_: lib.remove postgresql.jit installedExtensions);
+          passthru = {
+            inherit installedExtensions;
+            inherit (base)
+              dlSuffix
+              pkgs
+              psqlSchema
+              withJIT
+              withoutJIT
+              withPackages
+              ;
 
-          withPackages = f': recurse (ps: installedExtensions ++ f' ps);
+            pg_config = base.pg_config.override {
+              outputs = {
+                out = finalPackage;
+                man = finalPackage;
+              };
+            };
+          };
         };
-      };
-    in
-    finalPackage;
+      in
+      finalPackage;
 
 in
 # passed by <major>.nix
