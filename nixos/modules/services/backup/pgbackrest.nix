@@ -87,6 +87,20 @@ let
       default = null;
       internal = true;
     };
+
+  # Values of a path option across the global section and every command section.
+  pathsFor =
+    option:
+    lib.unique (
+      lib.filter (p: p != null) (
+        [ (cfg.settings.${option} or null) ]
+        ++ lib.mapAttrsToList (_: command: command.${option} or null) cfg.commands
+      )
+    );
+
+  # Directories pgBackRest creates itself, but which have to be shared between
+  # the pgbackrest and the postgres user.
+  sharedPaths = pathsFor "log-path" ++ pathsFor "lock-path" ++ pathsFor "spool-path";
 in
 
 {
@@ -380,7 +394,16 @@ in
       {
         services.pgbackrest.settings = {
           log-level-console = lib.mkDefault "info";
-          log-level-file = lib.mkDefault "off";
+          # Asynchronous archiving detaches the process that uploads a segment
+          # from PostgreSQL, so the log file is the only place its diagnostics
+          # end up. pgBackRest itself calls "off" not recommended.
+          log-level-file = lib.mkDefault "info";
+          log-path = lib.mkDefault "/var/log/pgbackrest";
+          # Both users run pgBackRest and both have to reach the same locks: a
+          # lock is how the stop command reaches a running archiver. The
+          # upstream default lands in /tmp, which PrivateTmp= hides from
+          # anything outside postgresql.service.
+          lock-path = lib.mkDefault "/run/pgbackrest";
           cmd-ssh = lib.getExe pkgs.openssh;
         };
 
@@ -396,8 +419,22 @@ in
           useDefaultShell = true;
           createHome = true;
           home = cfg.repos.localhost.path or "/var/lib/pgbackrest";
+          # The SFTP private key lives below the home directory and is read by
+          # the postgres user when archiving, which the 700 default prevents.
+          homeMode = "750";
         };
         users.groups.pgbackrest = { };
+
+        # Written by the pgbackrest user for scheduled backups and by the
+        # postgres user for archiving and restores. The setgid bit keeps the
+        # shared group on whatever either of them creates.
+        systemd.tmpfiles.settings.pgbackrest = lib.genAttrs sharedPaths (_: {
+          d = {
+            user = "pgbackrest";
+            group = "pgbackrest";
+            mode = "2770";
+          };
+        });
 
         systemd.services = lib.mapAttrs (
           _:
@@ -453,9 +490,15 @@ in
             user = "postgres";
           };
         };
-        # If PostgreSQL runs on the same machine, any restore will have to be done with that user.
-        # Keeping the lock file in a directory writeable by the postgres user prevents errors.
-        services.pgbackrest.commands.restore.lock-path = "/tmp/postgresql";
+        # archive_command and restore_command are children of postgresql.service
+        # and inherit its ProtectSystem=strict, which leaves them unable to
+        # write a spool acknowledgement, a log line or a lock. The paths are
+        # optional, so that a missing one cannot stop PostgreSQL from starting.
+        systemd.services.postgresql.serviceConfig.ReadWritePaths = map (path: "-${path}") (
+          lib.unique (
+            sharedPaths ++ lib.optional (cfg.repos.localhost.path or null != null) cfg.repos.localhost.path
+          )
+        );
         services.postgresql.identMap = ''
           postgres pgbackrest postgres
         '';

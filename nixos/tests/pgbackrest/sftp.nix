@@ -35,6 +35,13 @@ in
           sftp-private-key-file = "/var/lib/pgbackrest/sftp_key";
         };
 
+        # Archiving through a spool directory detaches the upload from
+        # PostgreSQL, so it exercises the paths the archiver needs to write.
+        commands.archive-push = {
+          archive-async = true;
+          spool-path = "/var/spool/pgbackrest";
+        };
+
         stanzas.default.jobs.future = {
           schedule = "3000-01-01";
           type = "diff";
@@ -73,12 +80,19 @@ in
         HOME="/var/lib/pgbackrest"
         cat ${snakeOilPrivateKey} > ~/sftp_key
         chown -R pgbackrest:pgbackrest ~/sftp_key
-        chmod 770 ~
+        chmod 640 ~/sftp_key
       """))
 
       with subtest("backup/restore works with local instance/remote repo (SFTP)"):
         primary.succeed("sudo -u pgbackrest pgbackrest --stanza=default stanza-create", timeout=10)
+
+        # check switches a WAL segment and waits for archive_command, running as
+        # the postgres user, to push it to the repository.
         primary.succeed("sudo -u pgbackrest pgbackrest --stanza=default check")
+
+        # The asynchronous archiver only reports failures to the log file.
+        primary.succeed("test -s /var/log/pgbackrest/default-archive-push-async.log")
+        primary.fail("grep -q ERROR /var/log/pgbackrest/*.log")
 
         primary.systemctl("start pgbackrest-default-future")
 
