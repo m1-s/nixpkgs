@@ -100,7 +100,8 @@ let
 
   # Written by both users: the pgbackrest user runs the scheduled backups and
   # the postgres user archives and restores.
-  groupPaths = pathsFor "lock-path";
+  sharedPaths = pathsFor "log-path" ++ pathsFor "lock-path";
+
 in
 
 {
@@ -395,6 +396,7 @@ in
         services.pgbackrest.settings = {
           log-level-console = lib.mkDefault "info";
           log-level-file = lib.mkDefault "off";
+          log-path = lib.mkDefault "/var/log/pgbackrest";
           lock-path = lib.mkDefault "/run/pgbackrest";
           cmd-ssh = lib.getExe pkgs.openssh;
         };
